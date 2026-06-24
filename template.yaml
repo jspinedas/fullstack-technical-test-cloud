@@ -1,0 +1,348 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  AWS Serverless Report Processing Service.
+  Flujo: API Gateway -> Lambda Producer -> SQS -> Lambda Worker -> SES.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PARAMETERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+Parameters:
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Nombre del ambiente de despliegue
+
+  SourceEmail:
+    Type: String
+    Description: >
+      Dirección de correo verificada en SES desde la que se enviarán los reportes.
+      Debe estar verificada antes del despliegue (dominio o email individual).
+
+  ConfigurationSetName:
+    Type: String
+    Description: >
+      Nombre del Configuration Set de SES para rastreo de entregas,
+      rebotes y quejas.
+
+  AlertEmail:
+    Type: String
+    Description: >
+      Dirección de correo que recibirá alertas operativas vía SNS.
+      Requiere confirmación manual tras el primer despliegue.
+
+  MaximumConcurrency:
+    Type: Number
+    Default: 10
+    MinValue: 2
+    MaxValue: 1000
+    Description: >
+      Máximo de invocaciones simultáneas de Lambda Worker.
+      Controla la tasa de envío hacia SES para evitar throttling.
+      Ver riesgo documentado: "Throttling SES" en project-context.md.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GLOBALS
+# Centraliza Runtime y Tracing para que ambas funciones no puedan divergir.
+# X-Ray (Tracing: Active) cubre Lambda Producer y Lambda Worker.
+# Nota: AWS::Serverless::HttpApi no expone TracingEnabled en CloudFormation
+# para HTTP API v2 — debe habilitarse post-despliegue vía consola o CLI.
+# ─────────────────────────────────────────────────────────────────────────────
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Tracing: Active
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESOURCES
+# ─────────────────────────────────────────────────────────────────────────────
+
+Resources:
+
+  # ── 1. SQS Dead Letter Queue ─────────────────────────────────────────────────
+  # Declarada antes que ReportsQueue porque ésta referencia su ARN.
+  # Almacena mensajes que superaron maxReceiveCount sin procesarse exitosamente.
+  # ADR-005: Aislamiento de mensajes fallidos.
+
+  ReportsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub reports-dlq-${Environment}
+      MessageRetentionPeriod: 345600  # 4 días — tiempo suficiente para diagnóstico
+      Tags:
+        - Key: Project
+          Value: report-processing
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── 2. SQS Main Queue ────────────────────────────────────────────────────────
+  # Desacopla API Gateway del procesamiento asíncrono (ADR-002).
+  # VisibilityTimeout: 180 = 6 × LambdaTimeout (30s) — valor mínimo recomendado
+  # por AWS para evitar re-entregas prematuras durante el procesamiento del batch.
+
+  ReportsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub reports-queue-${Environment}
+      VisibilityTimeout: 180
+      MessageRetentionPeriod: 345600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ReportsDLQ.Arn
+        maxReceiveCount: 3  # 3 intentos antes de pasar a DLQ
+      Tags:
+        - Key: Project
+          Value: report-processing
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── 3. SNS Alerts Topic ───────────────────────────────────────────────────────
+  # Receptor centralizado de todas las alarmas CloudWatch.
+  # La subscripción de email requiere confirmación manual tras el despliegue.
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub reports-alerts-${Environment}
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+      Tags:
+        - Key: Project
+          Value: report-processing
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── 4. API Gateway HTTP API ───────────────────────────────────────────────────
+  # HTTP API (v2) en lugar de REST API: más económico y simple (ADR-001).
+  # Expone únicamente POST /reports mediante Lambda Producer.
+
+  ReportsApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Environment
+      Description: HTTP API para solicitudes de generación de reportes
+      Tags:
+        Project: report-processing
+        Environment: !Ref Environment
+
+  # ── 5. Lambda Producer ────────────────────────────────────────────────────────
+  # DECISIÓN DE DISEÑO: Lambda Producer vs. integración directa API Gateway → SQS
+  #
+  # HTTP API soporta integración nativa con SQS sin Lambda (AWS service integration),
+  # lo que elimina un hop y reduce latencia y costo marginal por invocación.
+  # Sin embargo, se eligió Lambda Producer deliberadamente por las siguientes razones
+  # en el contexto de esta prueba técnica:
+  #
+  #   1. Complejidad operativa reducida: la integración directa AG→SQS requiere
+  #      configurar manualmente el request mapping (parámetros de query, headers y
+  #      body hacia ActionUrlParam/MessageBody de SQS) dentro del template SAM,
+  #      lo que aumenta la superficie de configuración propensa a error sin aportar
+  #      valor observable en una prueba técnica.
+  #
+  #   2. Validación en código: Lambda permite validar el payload (email, reportType)
+  #      en Node.js con lógica testeable por unitarios, en lugar de depender de
+  #      mapping templates o validadores de modelos de AG (que no aplican a HTTP API).
+  #
+  #   3. Consistencia con la estructura de carpetas del spec (§9): el spec define
+  #      explícitamente src/handlers/producer.js como parte del proyecto.
+  #
+  #   4. Extensibilidad sin cambiar infraestructura: agregar lógica (rate limiting,
+  #      enriquecimiento de payload, autenticación) no requiere tocar el template.
+  #
+  # Trade-off aceptado: añade ~1-5ms de latencia fría y ~$0.0000002 por invocación
+  # respecto a la integración directa. Irrelevante en el volumen actual.
+  #
+  # Memoria reducida (256 MB): no realiza procesamiento pesado.
+  # SQSSendMessagePolicy: otorga únicamente sqs:SendMessage — mínimo privilegio.
+  # QUEUE_URL inyectada como variable de entorno; no se hardcodea el ARN.
+
+  ProducerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub report-producer-${Environment}
+      Handler: src/handlers/producer.handler
+      Description: Valida el payload entrante y publica el mensaje en SQS
+      MemorySize: 256
+      Timeout: 10
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref ReportsQueue
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ReportsQueue.QueueName
+      Events:
+        PostReport:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ReportsApi
+            Method: POST
+            Path: /reports
+
+  # ── 6. Lambda Worker ─────────────────────────────────────────────────────────
+  # Consume mensajes de SQS, simula procesamiento pesado y envía correo por SES.
+  # Configuración del spec: MemorySize 512, Timeout 30.
+  #
+  # Permisos IAM (mínimo privilegio, spec sección 7):
+  #   SQSPollerPolicy → sqs:ReceiveMessage, DeleteMessage, GetQueueAttributes,
+  #                      ChangeMessageVisibility (necesario para extender timeout)
+  #   Statement explícito → ses:SendEmail, ses:SendRawEmail
+  #   Resource: '*' para SES porque las acciones de envío no tienen ARN de recurso
+  #   específico; puede restringirse al ARN de la identidad SES verificada.
+  #
+  # FunctionResponseTypes: ReportBatchItemFailures — habilita fallos parciales
+  # de batch: solo los mensajes fallidos vuelven a SQS, no el batch completo.
+  # Requiere que el handler retorne { batchItemFailures: [...] }.
+  #
+  # ScalingConfig.MaximumConcurrency — limita invocaciones simultáneas para
+  # no saturar SES (mitigación documentada en project-context.md §11).
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub report-worker-${Environment}
+      Handler: src/handlers/worker.handler
+      Description: Procesa mensajes SQS y envía correos mediante SES
+      MemorySize: 512
+      Timeout: 30
+      Environment:
+        Variables:
+          SOURCE_EMAIL: !Ref SourceEmail
+          CONFIGURATION_SET: !Ref ConfigurationSetName
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt ReportsQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: '*'
+      Events:
+        QueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ReportsQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 5
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            ScalingConfig:
+              MaximumConcurrency: !Ref MaximumConcurrency
+
+  # ── 7. CloudWatch Alarm: DLQ mensajes visibles ────────────────────────────────
+  # Dispara al primer mensaje que llega a DLQ (Threshold: 0, GreaterThan).
+  # OKActions notifica cuando la DLQ se vacía (confirma reprocesamiento exitoso).
+
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub reports-dlq-not-empty-${Environment}
+      AlarmDescription: Mensajes en DLQ detectados — fallos en el procesamiento de reportes
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ReportsDLQ.QueueName
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+
+  # ── 8. CloudWatch Alarm: errores en Lambda Worker ─────────────────────────────
+  # Complementa DLQAlarm: detecta errores transitorios que no llegaron a DLQ.
+
+  WorkerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub report-worker-errors-${Environment}
+      AlarmDescription: Errores detectados en Lambda Worker
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WorkerFunction
+      AlarmActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+
+  # ── 9. CloudWatch Alarm: backlog en cola principal ────────────────────────────
+  # Detecta acumulación aunque los mensajes no fallen.
+  # Threshold: 300s (5 min) — ajustar según SLA del servicio.
+
+  QueueBacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub reports-queue-backlog-${Environment}
+      AlarmDescription: Mensajes envejeciendo en cola principal — posible backlog acumulado
+      MetricName: ApproximateAgeOfOldestMessage
+      Namespace: AWS/SQS
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 300
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ReportsQueue.QueueName
+      AlarmActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OUTPUTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+Outputs:
+
+  ApiEndpoint:
+    Description: URL del endpoint HTTP API — POST /reports
+    Value: !Sub https://${ReportsApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/reports
+
+  ReportsQueueUrl:
+    Description: URL de la cola SQS principal
+    Value: !Ref ReportsQueue
+
+  ReportsDLQUrl:
+    Description: URL de la cola Dead Letter Queue
+    Value: !Ref ReportsDLQ
+
+  ProducerFunctionArn:
+    Description: ARN de Lambda Producer
+    Value: !GetAtt ProducerFunction.Arn
+
+  WorkerFunctionArn:
+    Description: ARN de Lambda Worker
+    Value: !GetAtt WorkerFunction.Arn
+
+  AlertsTopicArn:
+    Description: ARN del topic SNS de alertas operativas
+    Value: !Ref AlertsTopic
+
+  ReportsQueueName:
+    Description: Nombre de la cola SQS principal (útil para CLI y scripts de operación)
+    Value: !GetAtt ReportsQueue.QueueName
+
+  ReportsDLQName:
+    Description: Nombre de la cola Dead Letter Queue (útil para purge y redriving manual)
+    Value: !GetAtt ReportsDLQ.QueueName
